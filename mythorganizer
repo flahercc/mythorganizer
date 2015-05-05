@@ -1,0 +1,335 @@
+#! /bin/bash
+
+###############################################################################
+#read in file name from command line
+#connect to mythtv db and get relavent information about recording
+#check if there is an entry for show name in showtranslation file
+#check if there is a season and episode
+#if so create the showname
+#if not get the thetvdb.com xml file
+#clean up the xml file
+#check if there is episode info
+#if not use originalairdate to get info from xml file
+#use xml parser to get the node of the information to create a temp xml file
+#extract season and episode from temp xml file
+#create the showname
+#make show/season directory after checking if it already exists
+#create a pointer to show directory
+#generate com skip file
+#inform Kodi about the new file
+#exit
+###############################################################################
+
+#User Settings
+#working directory
+workingDir=/home/todd/.mythorganizer
+#the directory to move tvshow file
+tvDir=/home/todd/tv
+#the directory to move movie files
+movieDir=/home/todd/movies
+#the following line contains the API key from www.TheTvDb.Com.
+apiKey=9C42C2F2D2F613DD
+#Language setting
+lang=en
+#CommercialMarkup will generate comskip files for recordings when they are moved. Enabled|Disabled
+commMarkup=Enabled
+#Timeout for thetvdb.com
+Timeout=50
+
+#MythTV DB info
+#The IP address or name of the server for MythTV Database (used in python bindings only)
+dBHostName=localhost
+#MySQL User name: Default="mythtv"
+mySQLUser="mythtv" 
+#MySQL Password: Default="mythtv"
+mySQLPass="3YTWLTrA"
+#MythTV Backend server: Default=localhost
+mythTVBackendServer=localhost
+#The Database Pin for the MythTV Database (used in python bindings only)
+dBPin="0"
+#If utilizing mythconverg with Python Bindings, then it would be MySQLMythDb=PythonBindingsmythconverg
+mySQLMythDb=mythconverg
+
+#Kodi Settings
+kodiUpdate=Enabled
+#Send a notification to kodi to cleanup the library upon Successful move job Enabled|Disabled
+kodiClean=Enabled
+#Send Notifications to kodi UI when library is updated Enabled|Disabled
+kodiNotify=Enabled
+#Ip Address and port for kodi Notifications Eg.kodiIPs=( "192.168.1.110:8080" "192.168.1.111:8080" "XBOX:8080" )
+kodiIPs=( "192.168.1.130:8080" "192.168.1.112:8080" )
+
+####Start Functions#####
+
+#####UTILIZE PYTHON BINDINGS TO GET MYTHTV DB##### Requires dependency
+ShowTranslation() {
+  if [ -f "$workingDir"/showtranslation ] && [ "$ShowName" != "" ]; then 
+    showtranslation=`grep "$ShowName = " "$workingDir/showTranslations"| sed s/"$ShowName = "/""/g `		 
+    if [ "$showtranslation" != "" ]; then 
+      ShowName=$showtranslation
+      echo "USER TRANSLATION: $InputTitle = $ShowName">>"$workingDir"/output.log
+    elif [ "$showtranslation" = "" ]; then
+       showtranslation="Inactive"
+    fi
+  fi
+  return 0
+}
+
+GetRecordingInfo() {
+  echo "Attemting to pull database information on $InputPath"
+
+  #make a named pipe for database output
+  test ! -p "$workingDir/dbout" && mkfifo "$workingDir/dbout" 
+
+  #run the python bindings and output to named pipe
+  /usr/local/bin/MythDataGrabber --filename="$InputFileBasename" --DBPin="$dBPin" --DBHostName="$dBHostName" --DBName="$mySQLMythDb" --DBUserName="$mySQLuser" --DBPassword="$mySQLpass"> "$workingDir/dbout" &
+  pythonExitStatus=$?
+  test "$pythonExitStatus" != "0" && echo "DATABASE ACCESS ERROR: COULD NOT OBTAIN INFORMATION \n Check DBInfo in mythicalSetup, verify file is mythtv file"
+
+  #read values from named pipe, remove quotes and declare $Variable=$Value
+  while read var equals value
+  do 
+    value=`echo $value|tr -d \"`
+    test "$equals" = "=" && declare $var="$value"
+    echo $var$equals$value
+  done < "$workingDir/dbout" > /dev/null 2>&1
+ 
+  #Output commercial data to initial file
+  if [ "$commMarkup" = "Enabled" ]; then
+    printf "%s\n" "${startdata[@]}" >$workingDir/markupstart.txt
+    printf "%s\n" "${stopdata[@]}"  >$workingDir/markupstop.txt
+    #Combine commercial data into a single comskip file and remove the initial files
+    GenComSkip
+  fi
+
+  #Import mythtv values into workingDir values, don't clobber title, subtitle.
+  test "$InputTitle" = "" && InputTitle=$title
+  test "$InputSubtitle" = "" && InputSubtitle=$subtitle; 
+  #redefine database var names into workingDir var names
+  MovieAirDate=$airdate
+  OriginalAirDate=$originalairdate
+  ShowCategory=$category
+  Stars=$stars
+  Plot=$description
+  Zap2itSeriesID=$seriesid
+  ProgramID=$programid
+  ChanID=$chanid
+  ShowStartTime=$starttime
+  Season=$season
+  Episode=$episode
+  
+  #Create MV/EP/SH Identification Type from ProgramID
+  progId=${ProgramID:0:2}
+   
+  #cleanup, remove the fifo named pipe
+  test -p "$workingDir/dbout" && rm -f "$workingDir/dbout" 
+}
+
+GetSeriesXML()  {
+  #Search TheTvDb and return an XML file with results
+  curl -L -s -m"$Timeout" www.thetvdb.com/api/GetSeries.php?seriesname=$tvdbshowname>"$workingDir/working.xml"
+  echo "creating working.xml by grabbing www.thetvdb.com/api/GetSeries.php?seriesname=$tvdbshowname"
+ 
+  #Separate the XML into textual DBs conatining SeriesID, ShowName and Zap2it IDs
+  cat "$workingDir/working.xml" | grep "<seriesid>"|sed -e s/"<seriesid>"/""/ -e s/"<\/seriesid>"/""/ -e s/'&quot;'/'"'/ -e s/"&amp;"/"\&"/ -e s/'&ndash;'/'-'/ -e s/"&lt;"/"<"/ -e s/"&gt;"/">"/ >"$workingDir/sid.txt"
+  cat "$workingDir/working.xml" | grep "<SeriesName>"| sed -e s/"<SeriesName>"// -e s/"<\/SeriesName>"// -e s/'&quot;'/'"'/ -e s/"&amp;"/"\&"/ -e s/'&ndash;'/'-'/ -e s/"&lt;"/"<"/ -e s/"&gt;"/">"/ >"$workingDir/shn.txt"
+ 	 
+  #parse the XML for shows with Zap2ItIDs
+  test -f "$workingDir/zap2it.txt" && rm -f "$workingDir/zap2it.txt"
+  while read line
+  do 
+    test "$line" = "<Series>" && NextShow=1
+    test "$line" = "</Series>" && test "$NextShow" = "1" && echo "" >>"$workingDir/zap2it.txt" && NextShow=0
+    if [[ $line =~ '<zap2it_id>'* ]] ; then
+      echo $line| sed -e s/"<zap2it_id>"/""/ -e s/"<\/zap2it_id>"/""/ -e s/'&quot;'/'"'/ -e s/"&amp;"/"\&"/ -e s/'&ndash;'/'-'/ -e s/"&lt;"/"<"/ -e s/"&gt;"/">"/ >>"$workingDir/zap2it.txt"
+      NextShow=0
+    fi
+  done < "$workingDir/working.xml"
+}
+
+SetSeriesID()  {
+  #Get the seriesid based on the showname
+  SeriesID=`sed -n $serieslinenumber'p' "$workingDir"/sid.txt|grep -m1 ^`
+  NewShowName=`sed -n $serieslinenumber'p' "$workingDir"/shn.txt|grep -m1 ^|sed s/"&amp;"/"\&"/g`
+	 
+  #Cleanup files to prevent mismatch next time
+  test -f "$workingDir"/sid.txt && rm -f "$workingDir"/sid.txt
+  test -f "$workingDir"/shn.txt && rm -f "$workingDir"/shn.txt
+  test -f "$workingDir"/Zap2it.txt && rm -f "$workingDir"/zap2it.txt
+}
+
+CreateFileName() {
+  #if it a movie just name it the movie title
+  if [ $progId = "MV" ]
+  then
+    progfilename=$InputTitle"."$extension
+    moveDir=$movieDir
+  else
+    SE=$Season"x"$Episode
+    progfilename="$InputTitle - $SE - $InputSubtitle.$extension"
+    moveDir=$tvDir
+  fi
+}
+
+#####COMSKIP FILES#####
+#Function GenComSkip creates a comskip.txt file for use with the show upon moving, created from data from library
+GenComSkip() {
+  workingDirCounter=1
+
+  #Set up comskip file
+  test -f "$workingDir/markupframes.txt" && rm -f "$workingDir/markupframes.txt"
+  echo "FILE PROCESSING COMPLETE">"$workingDir"/markupframes.txt
+  echo "------------------------">>"$workingDir"/markupframes.txt	
+  while read line
+  do
+    workingDirCounter=`expr $workingDirCounter + 1`;
+    StartData=`sed -n "$workingDirCounter"p "$workingDir/markupstart.txt"`
+    StopData=`sed -n "$workingDirCounter"p "$workingDir/markupstop.txt"`
+    if [ ! -z "$StopData" ]; then
+      echo "$StartData $StopData">>"$workingDir"/markupframes.txt
+      CommercialMarkup="Created"
+      echo "COMMERCIAL DATA START:$StartData STOP:$StopData"
+    fi
+  done <"$workingDir/markupstop.txt"
+  return 0
+}
+ 
+#####Kodi COMMUNICATIONS#####
+#This function Automates communication with kodi 
+KodiAutomate() {
+  #Send notification to kodi, Update Library, Clean Library
+  if [ "$kodiNotify" = "Enabled" -o "$kodiUpdate" = "Enabled" -o "$kodiClean" = "Enabled" ]; then
+    for kodiIP in ${kodiIPs[@]}
+    do
+      echo "SENDING REQUESTED COMMANDS TO:$kodiIP"
+      test "$kodiNotify" = "Enabled" && curl -L -s -m3 --connect-timeout 5 -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"GUI.ShowNotification","params":{"title":"mythical Librarian adding","message":"'$InputTitle'"},"id":1}' http://$kodiIP/jsonrpc > /dev/null 2>&1
+      test "$kodiNotify" = "Enabled" && curl -L -s -m3 --connect-timeout 5 -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"VideoLibrary.Scan","id":1}' http://$kodiIP/jsonrpc > /dev/null 2>&1
+      test "$kodiNotify" = "Enabled" && curl -L -s -m3 --connect-timeout 5 -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"VideoLibrary.Clean","id":1}' http://$kodiIP/jsonrpc > /dev/null 2>&1
+	done
+  fi
+  return 0
+}
+
+GetShowXML() {
+  #Download information from server
+  #echo -ne "Downloading Series: $SeriesID \r" 1>&2 
+  echo "Downloading Series: $SeriesID"
+  curl -L -s -m"$Timeout" "http://www.thetvdb.com/api/$apiKey/series/$SeriesID/all/$lang.xml"| grep -vE "(</id>|</Combined_episodenumber>|</Combined_season>|</DVD_chapter>|</DVD_discid>|</DVD_episodenumber>|</DVD_season>|</Director>|</EpImgFlag>|</GuestStars>|</IMDB_ID>|</Language>|</Overview>|</ProductionCode>|</RatingCount>|</filename>|</seasonid>|</Writer>|</Rating>|</lastupdated>|</seriesid>|</absolute_number>)">"$workingDir/$InputTitle.xmlTest" && echo "$CurrentTime" > "$workingDir/lastupdated.time"
+
+  #Validate that the show has a EpisodeName tag and is a valid download before clobering our old download.
+  grepTest=""
+  grepTest=`grep "EpisodeName" "$workingDir/$InputTitle.xmlTest"`
+  test "$grepTest" != "" && mv "$workingDir/$InputTitle.xmlTest" "$workingDir/$InputTitle.xml"
+
+  #create a folder/file "database" Strip XML tags.  Series, Exx and Sxx are separated into different files
+  if [ -f "$workingDir/$InputTitle.xml" ]; then
+    echo "Cleaning up $InputTitle.xml file"
+	#cleanup the xml file of missing </Overview> tags
+	sed -i '/<Overview>/d' "$workingDir/$InputTitle.xml"
+        #xmlstarlet ed -d "//Overview" "$workingDir/$InputTitle.xml" > temp.xml
+	
+	#extract the episode node from the xml
+        echo "Extracting Episode node for $InputSubtitle from xml file"
+	xmlstarlet sel -t -c "/Data/Episode[EpisodeName='$InputSubtitle']" "$workingDir/$InputTitle.xml" > "$workingDir/episode.xml"
+    
+    #check if the xml file was downloaded and create an error message
+  elif [ ! -f "$workingDir/$InputTitle.xml" ]; then
+    echo "COULD NOT DOWNLOAD:www.thetvdb.com/api/$APIkey/series/$SeriesID/all/$Language.xml">>"$workingDir"/output.log
+  fi
+    
+  return 1
+}
+
+GetSeasonAndEpisodeInfo() {
+  if [ -f "$workingDir/episode.xml" ]; then  
+    while read line
+    do
+      #Get Season number
+      if [[ $line == \<SeasonNumber\>* ]]; then
+        line=${line/<\/SeasonNumber>/}
+        line=${line/<SeasonNumber>/}
+        Season=$line
+      #Get Episode number
+      elif [[ $line == \<EpisodeNumber\>* ]]; then
+        line=${line/<\/EpisodeNumber>/}
+        line=${line/<EpisodeNumber>/}
+        Episode=$line
+      fi
+    done < "$workingDir/episode.xml"
+  fi
+}
+
+#####Make Show Folder#####
+MakeShowDir() {
+  #If specified, make $movedir = $movedir/show name
+  if [ "$InputTitle" != "" ]; then
+    moveDir="$moveDir/$InputTitle"
+    if [ ! -d "$moveDir" ]; then
+      echo "CREATING FOLDER: $moveDir">>"$workingDir"/output.log
+      echo "$moveDir">>"$workingDir"/dir.tracking
+      mkdir "$moveDir"
+      chmod 777 "$moveDir"
+    fi
+    #Make the Season folder if it is applicable and does not exist
+    if [ "$Season" != "" ] && [ $progId != "MV" ]; then
+      moveDir="$moveDir/Season $Season" 
+      if [ ! -d "$moveDir" ]; then
+        mkdir "$moveDir" 
+        chmod 777 "$moveDir"
+        echo "$moveDir">>"$workingDir"/dir.tracking
+      fi
+    fi
+  fi
+  
+  #Error message if folder was not created
+  if [ ! -d "$moveDir" ]; then
+    echo "COULD NOT CREATE $moveDir/$InputTitle">>"$workingDir"/output.log
+  fi
+}
+
+#####End Functions######
+
+####Start Main####
+
+InputPath=$1
+
+InputFileBasename=$(basename "$InputPath")
+extension="${InputFileBasename##*.}"
+filename="${InputFileBasename%.*}"
+
+#Create working directory
+if [ ! -d "$workingDir" ]; then
+        mkdir "$workingDir"
+fi
+
+GetRecordingInfo
+ShowTranslation
+
+if [ $progId == "MV" ]; then
+  CreateFileName
+  MakeShowDir
+else
+  #universally not accepted file system characters:  |\?*<":>+[]/ 
+  #Format Shows
+  #EpisodeSubtitle=`echo $EpisodeSubtitle| tr -d '!|\?*<":>+[]/'"'"`
+  #NewShowName=`echo $NewShowName|tr -d '!|\?*<":>+[]/'"'"`
+  ShowName=`echo $InputTitle|tr -d '!|\?*<":>+[]/'"'"`
+  #SafeShowName=`echo "$ShowName"|sed 's/;.*//'|tr -d '|\?*<":>+[]/'`
+  #Format Show name for Sending to www.TheTvDb.com and XBMC
+  tvdbshowname=`echo $ShowName | sed s/" "/"%20"/g|sed s/"&"/"%26"/g`
+
+  #if [ $Season == "" ] || [ $Episode == "" ]; then
+  GetSeriesXML
+  SetSeriesID
+  GetShowXML
+  GetSeasonAndEpisodeInfo
+  CreateFileName
+  MakeShowDir
+fi
+
+#create the symlink to the show directory
+ln -s "$InputPath" "$moveDir/$progfilename"
+echo "Moved $InputPath to $moveDir/$progfilename"
+
+KodiAutomate
+#####End Main#####
